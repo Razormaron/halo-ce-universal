@@ -26,6 +26,10 @@ Conventions carried over from the Xbox:
 #include "halo_ui_pointer.h"
 #include "port_config.h"
 
+#ifndef HALO_ANDROID
+#include <SDL3/SDL_video.h>
+#endif
+
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -731,6 +735,29 @@ static GLuint compile_shader(GLenum type, const char *source, const char *what)
 }
 
 #ifndef HALO_ANDROID
+/* Query-buffer objects require OpenGL 4.4 or ARB_query_buffer_object.
+   OpenGL 4.2 may expose ARB_buffer_storage without query-buffer support. */
+static BOOL desktop_gl_has_extension(const char *name)
+{
+	/* Resolve the OpenGL entry point from the active SDL GL context.
+	   Calling glGetStringi directly adds an unresolved linker symbol on
+	   builds which obtain OpenGL functions dynamically. */
+	typedef const GLubyte *(GLAPIENTRY *get_string_i_fn)(GLenum, GLuint);
+	get_string_i_fn get_string_i = (get_string_i_fn)SDL_GL_GetProcAddress("glGetStringi");
+	GLint count = 0, i;
+
+	if (!get_string_i)
+		return FALSE;
+	glGetIntegerv(GL_NUM_EXTENSIONS, &count);
+	for (i = 0; i < count; i++)
+	{
+		const char *extension = (const char *)get_string_i(GL_EXTENSIONS, (GLuint)i);
+		if (extension && !strcmp(extension, name))
+			return TRUE;
+	}
+	return FALSE;
+}
+
 static void GLAPIENTRY gl_debug_callback(GLenum source, GLenum type, GLuint id, GLenum severity,
 	GLsizei length, const GLchar *message, const void *user)
 {
@@ -953,14 +980,25 @@ static void gl_initialize(void)
 	glGenSamplers(D3DTSS_MAXSTAGES, device.samplers);
 	glGenQueries(VISIBILITY_TEST_SLOTS, device.queries);
 #ifndef HALO_ANDROID
-	glGenBuffers(1, &device.visibility_results_buffer);
-	glBindBuffer(GL_QUERY_BUFFER, device.visibility_results_buffer);
-	glBufferStorage(GL_QUERY_BUFFER, VISIBILITY_TEST_SLOTS * sizeof(GLuint), NULL,
-		GL_MAP_READ_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT);
-	device.visibility_results = glMapBufferRange(GL_QUERY_BUFFER, 0, VISIBILITY_TEST_SLOTS * sizeof(GLuint),
-		GL_MAP_READ_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT);
-	if (!device.visibility_results)
-		platform_log("cannot map the visibility test results; tests wait for the GPU");
+	/* When query-buffer objects are unavailable, leave visibility_results NULL.
+	   GetVisibilityTestResult already handles this using GL_QUERY_RESULT_AVAILABLE
+	   and ordinary query readback instead of persistent mapped storage. */
+	if ((major > 4 || (major == 4 && minor >= 4)) ||
+		(desktop_gl_has_extension("GL_ARB_query_buffer_object") &&
+		 desktop_gl_has_extension("GL_ARB_buffer_storage")))
+	{
+		glGenBuffers(1, &device.visibility_results_buffer);
+		glBindBuffer(GL_QUERY_BUFFER, device.visibility_results_buffer);
+		glBufferStorage(GL_QUERY_BUFFER, VISIBILITY_TEST_SLOTS * sizeof(GLuint), NULL,
+			GL_MAP_READ_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT);
+		device.visibility_results = glMapBufferRange(GL_QUERY_BUFFER, 0, VISIBILITY_TEST_SLOTS * sizeof(GLuint),
+			GL_MAP_READ_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT);
+		glBindBuffer(GL_QUERY_BUFFER, 0);
+		if (!device.visibility_results)
+			platform_log("cannot map the visibility test results; using ordinary queries");
+	}
+	else
+		platform_log("GPU: query-buffer objects unavailable; using ordinary visibility queries");
 	{
 		long every = config_integer("debug.gpu_flush_draws");
 		const char *renderer = (const char *)glGetString(GL_RENDERER);
